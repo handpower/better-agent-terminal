@@ -58,6 +58,7 @@ const electronAPI = {
   app: {
     openNewInstance: (profileId: string) => ipcRenderer.invoke('app:open-new-instance', profileId),
     getLaunchProfile: () => ipcRenderer.invoke('app:get-launch-profile') as Promise<string | null>,
+    setDockBadge: (count: number) => ipcRenderer.invoke('app:set-dock-badge', count),
   },
   update: {
     check: () => ipcRenderer.invoke('update:check'),
@@ -68,7 +69,7 @@ const electronAPI = {
     writeImage: (filePath: string) => ipcRenderer.invoke('clipboard:writeImage', filePath),
   },
   claude: {
-    startSession: (sessionId: string, options: { cwd: string; prompt?: string; permissionMode?: string; model?: string }) =>
+    startSession: (sessionId: string, options: { cwd: string; prompt?: string; permissionMode?: string; model?: string; effort?: string }) =>
       ipcRenderer.invoke('claude:start-session', sessionId, options),
     sendMessage: (sessionId: string, prompt: string, images?: string[]) =>
       ipcRenderer.invoke('claude:send-message', sessionId, prompt, images),
@@ -130,6 +131,8 @@ const electronAPI = {
       ipcRenderer.invoke('claude:get-account-info', sessionId) as Promise<{ email?: string; organization?: string; subscriptionType?: string } | null>,
     getSupportedCommands: (sessionId: string) =>
       ipcRenderer.invoke('claude:get-supported-commands', sessionId) as Promise<{ name: string; description: string; argumentHint: string }[]>,
+    scanSkills: (cwd: string) =>
+      ipcRenderer.invoke('claude:scan-skills', cwd) as Promise<{ name: string; description: string; scope: 'project' | 'global' }[]>,
     getSessionMeta: (sessionId: string) =>
       ipcRenderer.invoke('claude:get-session-meta', sessionId) as Promise<Record<string, unknown> | null>,
     getUsage: () =>
@@ -207,6 +210,13 @@ const electronAPI = {
     readdir: (dirPath: string) => ipcRenderer.invoke('fs:readdir', dirPath) as Promise<{ name: string; path: string; isDirectory: boolean }[]>,
     readFile: (filePath: string) => ipcRenderer.invoke('fs:readFile', filePath) as Promise<{ content?: string; error?: string; size?: number }>,
     search: (dirPath: string, query: string) => ipcRenderer.invoke('fs:search', dirPath, query) as Promise<{ name: string; path: string; isDirectory: boolean }[]>,
+    watch: (dirPath: string) => ipcRenderer.invoke('fs:watch', dirPath) as Promise<boolean>,
+    unwatch: (dirPath: string) => ipcRenderer.invoke('fs:unwatch', dirPath) as Promise<boolean>,
+    onChanged: (callback: (dirPath: string) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, dirPath: string) => callback(dirPath)
+      ipcRenderer.on('fs:changed', handler)
+      return () => ipcRenderer.removeListener('fs:changed', handler)
+    },
   },
   profile: {
     list: () => ipcRenderer.invoke('profile:list') as Promise<{ profiles: { id: string; name: string; type: 'local' | 'remote'; remoteHost?: string; remotePort?: number; remoteToken?: string; createdAt: number; updatedAt: number }[]; activeProfileId: string }>,

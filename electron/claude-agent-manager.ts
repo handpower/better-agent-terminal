@@ -1,4 +1,4 @@
-import { BrowserWindow } from 'electron'
+import { BrowserWindow, Notification, app } from 'electron'
 import { createRequire } from 'module'
 import * as fsSync from 'fs'
 import * as fsPromises from 'fs/promises'
@@ -6,6 +6,7 @@ import * as pathModule from 'path'
 import type { ClaudeMessage, ClaudeToolCall, ClaudeSessionState } from '../src/types/claude-agent'
 import type { Query, PermissionMode, CanUseTool, SlashCommand } from '@anthropic-ai/claude-agent-sdk'
 import { logger } from './logger'
+import { getNodeExecutable, isElectronFallback } from './node-resolver'
 
 // App-level permission mode extends SDK's PermissionMode with bypassPlan
 // bypassPlan = plan mode (read-only exploration) + auto-approve all tool permissions
@@ -90,6 +91,7 @@ interface SessionMetadata {
   durationMs: number
   numTurns: number
   contextWindow: number
+  maxOutputTokens: number
 }
 
 interface PendingRequest {
@@ -107,6 +109,7 @@ interface ActiveTask {
   summary?: string
   lastProgressTime: number
   stalled?: boolean
+  lastToolName?: string
 }
 
 interface SessionInstance {
@@ -130,8 +133,6 @@ interface SessionInstance {
 
 // Persists SDK session IDs across stop/restart so we can resume conversations
 const sdkSessionIds = new Map<string, string>()
-
-let forkSessionFn: typeof import('@anthropic-ai/claude-agent-sdk').forkSession | null = null
 
 export class ClaudeAgentManager {
   private sessions: Map<string, SessionInstance> = new Map()
@@ -168,6 +169,58 @@ export class ClaudeAgentManager {
       }
     }
     broadcastHub.broadcast(channel, ...args)
+  }
+
+  /**
+   * Send a macOS/Windows/Linux system notification when Agent completes.
+   * Reads settings from settings.json to check if notifications are enabled.
+   */
+  private sendCompletionNotification(session: { cwd: string }, result?: string) {
+    try {
+      if (!Notification.isSupported()) return
+
+      // Read settings directly from file (main process doesn't have settings store)
+      const settingsPath = pathModule.join(app.getPath('userData'), 'settings.json')
+      let settings: Record<string, unknown> = {}
+      try {
+        settings = JSON.parse(fsSync.readFileSync(settingsPath, 'utf-8'))
+      } catch { /* settings file doesn't exist or is invalid */ }
+
+      // Check if notifications are enabled (default: true)
+      if (settings.notifyOnComplete === false) return
+
+      // Check if only notify when window is not focused
+      if (settings.notifyOnlyBackground !== false) {
+        const focused = this.getWindows().some(w => !w.isDestroyed() && w.isFocused())
+        if (focused) return
+      }
+
+      const workspaceName = pathModule.basename(session.cwd)
+      const body = result
+        ? result.slice(0, 100) + (result.length > 100 ? '...' : '')
+        : 'Task completed'
+
+      const notification = new Notification({
+        title: `✅ ${workspaceName}`,
+        body,
+        silent: settings.notifySound === false,
+      })
+
+      notification.on('click', () => {
+        // Focus the main window when notification is clicked
+        for (const win of this.getWindows()) {
+          if (!win.isDestroyed()) {
+            win.show()
+            win.focus()
+            break
+          }
+        }
+      })
+
+      notification.show()
+    } catch (err) {
+      logger.error('[notification] Failed to send:', err)
+    }
   }
 
   private static readonly MSG_BUFFER_CAP = 300
@@ -207,7 +260,7 @@ export class ClaudeAgentManager {
     this.send('claude:tool-result', sessionId, { id: toolId, ...updates })
   }
 
-  async startSession(sessionId: string, options: { cwd: string; prompt?: string; sdkSessionId?: string; permissionMode?: AppPermissionMode; model?: string }): Promise<boolean> {
+  async startSession(sessionId: string, options: { cwd: string; prompt?: string; sdkSessionId?: string; permissionMode?: AppPermissionMode; model?: string; effort?: 'low' | 'medium' | 'high' | 'max' }): Promise<boolean> {
     // Prevent duplicate session creation
     if (this.sessions.has(sessionId)) {
       return true
@@ -240,11 +293,12 @@ export class ClaudeAgentManager {
           durationMs: 0,
           numTurns: 0,
           contextWindow: 0,
+          maxOutputTokens: 0,
         },
         pendingPermissions: new Map(),
         pendingAskUser: new Map(),
         permissionMode: options.permissionMode || 'default',
-        effort: 'high',
+        effort: options.effort || 'medium',
         enable1MContext: false,
         model: options.model,
         messageQueue: [],
@@ -306,7 +360,17 @@ export class ClaudeAgentManager {
       return true
     }
 
-    // Note: user message is added by the frontend — don't duplicate here
+    // Broadcast user message so all windows (including remote host) can see it.
+    // The sender's frontend already adds it locally; dedup by id prevents doubles.
+    const userMsg: ClaudeMessage = {
+      id: `user-${Date.now()}`,
+      sessionId,
+      role: 'user',
+      content: prompt + (images?.length ? `\n[${images.length} image${images.length > 1 ? 's' : ''} attached]` : ''),
+      timestamp: Date.now(),
+    }
+    this.addMessage(sessionId, userMsg)
+
     await this.runQuery(sessionId, prompt, images)
     return true
   }
@@ -324,11 +388,17 @@ export class ClaudeAgentManager {
 
     // Declare resumeId outside try so it's accessible in catch for retry logic
     const resumeId = session.sdkSessionId
+    const electronFallback = isElectronFallback()
 
     try {
       const query = await getQuery()
       const claudeCodePath = resolveClaudeCodePath()
-      logger.log(`[Claude] runQuery: cwd=${session.cwd}, resumeId=${resumeId || 'none'}, claudeCodePath=${claudeCodePath || 'none'}`)
+      const nodeExecutable = getNodeExecutable()
+      if (electronFallback) {
+        process.env.ELECTRON_RUN_AS_NODE = '1'
+        logger.log('[Claude] Using Electron binary as Node.js runtime (ELECTRON_RUN_AS_NODE=1)')
+      }
+      logger.log(`[Claude] runQuery: cwd=${session.cwd}, resumeId=${resumeId || 'none'}, claudeCodePath=${claudeCodePath || 'none'}, nodeExecutable=${nodeExecutable}`)
       const canUseTool: CanUseTool = async (toolName, input, opts) => {
         // Check if this is an AskUserQuestion tool — always show UI
         if (toolName === 'AskUserQuestion') {
@@ -411,6 +481,29 @@ export class ClaudeAgentManager {
         })
       }
 
+      // Load installed plugins from ~/.claude/plugins/installed_plugins.json
+      const installedPlugins: Array<{ type: 'local'; path: string }> = []
+      try {
+        const os = await import('os')
+        const pluginsJsonPath = pathModule.join(os.homedir(), '.claude', 'plugins', 'installed_plugins.json')
+        const pluginsData = JSON.parse(fsSync.readFileSync(pluginsJsonPath, 'utf-8'))
+        if (pluginsData.plugins) {
+          for (const entries of Object.values(pluginsData.plugins)) {
+            for (const entry of entries as Array<{ installPath?: string }>) {
+              if (entry.installPath) {
+                installedPlugins.push({ type: 'local', path: entry.installPath })
+              }
+            }
+          }
+        }
+        if (installedPlugins.length > 0) {
+          logger.log(`[Claude] Loaded ${installedPlugins.length} plugins: ${installedPlugins.map(p => pathModule.basename(pathModule.dirname(p.path)) + '/' + pathModule.basename(p.path)).join(', ')}`)
+        }
+      } catch (e) {
+        // No plugins file or parse error — continue without plugins
+        logger.log('[Claude] No installed plugins found or failed to parse:', e)
+      }
+
       const currentMode = session.permissionMode
       // Map app-level bypassPlan to SDK's plan mode
       const sdkMode: PermissionMode = currentMode === 'bypassPlan' ? 'plan' : currentMode
@@ -430,8 +523,10 @@ export class ClaudeAgentManager {
         agentProgressSummaries: true,
         ...(session.model ? { model: session.model } : {}),
         ...(session.enable1MContext ? { betas: ['context-1m-2025-08-07'] } : {}),
+        ...(installedPlugins.length > 0 ? { plugins: installedPlugins } : {}),
         canUseTool,
         ...(claudeCodePath ? { pathToClaudeCodeExecutable: claudeCodePath } : {}),
+        ...(nodeExecutable !== 'node' || electronFallback ? { executable: nodeExecutable } : {}),
         stderr: (data: string) => {
           logger.error('[Claude Code stderr]', data)
           stderrOutput += data
@@ -490,6 +585,9 @@ export class ClaudeAgentManager {
         const msgSubtype = (message as { subtype?: string }).subtype
         if (message.type !== 'stream_event' && message.type !== 'assistant') {
           logger.log(`[claude:msg] type=${message.type} subtype=${msgSubtype || ''} parent_tool_use_id=${(message as { parent_tool_use_id?: string }).parent_tool_use_id || 'none'}`)
+        }
+        if (message.type === 'rate_limit_event') {
+          logger.log(`[claude:rate_limit_event] ${JSON.stringify(message)}`)
         }
         if (message.type === 'assistant') {
           const blocks = (message as { message?: { content?: unknown[] } }).message?.content
@@ -550,6 +648,15 @@ export class ClaudeAgentManager {
                   parentToolUseId: message.parent_tool_use_id,
                   timestamp: Date.now(),
                 })
+                // Keep parent active task alive when subagent produces messages
+                if (message.parent_tool_use_id) {
+                  const parentTask = Array.from(session.activeTasks.values())
+                    .find(t => t.toolUseId === message.parent_tool_use_id)
+                  if (parentTask) {
+                    parentTask.lastProgressTime = Date.now()
+                    parentTask.stalled = false
+                  }
+                }
               }
               if ('type' in block && block.type === 'tool_use') {
                 const toolBlock = block as { id: string; name: string; input: Record<string, unknown> }
@@ -562,6 +669,28 @@ export class ClaudeAgentManager {
                   parentToolUseId: message.parent_tool_use_id,
                   timestamp: Date.now(),
                 })
+                // Update parent active task progress when subagent uses tools
+                if (message.parent_tool_use_id) {
+                  const parentTask = Array.from(session.activeTasks.values())
+                    .find(t => t.toolUseId === message.parent_tool_use_id)
+                  if (parentTask) {
+                    parentTask.lastProgressTime = Date.now()
+                    parentTask.stalled = false
+                    const toolLabel = toolBlock.name === 'Bash'
+                      ? `Bash: ${((toolBlock.input as Record<string, unknown>)?.command as string)?.slice(0, 40) || '...'}`
+                      : toolBlock.name === 'Read' || toolBlock.name === 'Write' || toolBlock.name === 'Edit'
+                        ? `${toolBlock.name}: ${((toolBlock.input as Record<string, unknown>)?.file_path as string)?.split('/').pop() || '...'}`
+                        : toolBlock.name === 'Grep'
+                          ? `Grep: ${((toolBlock.input as Record<string, unknown>)?.pattern as string)?.slice(0, 30) || '...'}`
+                          : toolBlock.name === 'Glob'
+                            ? `Glob: ${((toolBlock.input as Record<string, unknown>)?.pattern as string)?.slice(0, 30) || '...'}`
+                            : toolBlock.name
+                    parentTask.summary = toolLabel
+                    this.updateToolCall(sessionId, parentTask.toolUseId, {
+                      description: toolLabel,
+                    } as Partial<ClaudeToolCall>)
+                  }
+                }
                 // Track Agent/Task tool calls in activeTasks for stop support
                 // (task_started events may not always be emitted by the SDK)
                 if ((toolBlock.name === 'Agent' || toolBlock.name === 'Task') && !message.parent_tool_use_id) {
@@ -667,6 +796,15 @@ export class ClaudeAgentManager {
                 parentToolUseId: message.parent_tool_use_id,
               })
             }
+            // Keep parent active task alive during subagent streaming
+            if (message.parent_tool_use_id && (event.delta?.text || event.delta?.thinking)) {
+              const parentTask = Array.from(session.activeTasks.values())
+                .find(t => t.toolUseId === message.parent_tool_use_id)
+              if (parentTask) {
+                parentTask.lastProgressTime = Date.now()
+                parentTask.stalled = false
+              }
+            }
           }
         }
 
@@ -742,9 +880,14 @@ export class ClaudeAgentManager {
                 task.lastProgressTime = Date.now()
                 task.summary = agentMsg.description || agentMsg.summary
                 task.stalled = false
+                if (agentMsg.last_tool_name) {
+                  task.lastToolName = agentMsg.last_tool_name
+                }
                 if (task.toolUseId) {
+                  const desc = agentMsg.description || task.description
+                  const toolSuffix = task.lastToolName ? ` [${task.lastToolName}]` : ''
                   this.updateToolCall(sessionId, task.toolUseId, {
-                    description: agentMsg.description || task.description,
+                    description: desc + toolSuffix,
                   } as Partial<ClaudeToolCall>)
                 }
               }
@@ -771,8 +914,11 @@ export class ClaudeAgentManager {
             num_turns?: number
             result?: string
             errors?: string[]
-            modelUsage?: Record<string, { contextWindow?: number; inputTokens?: number; outputTokens?: number }>
+            modelUsage?: Record<string, { contextWindow?: number; inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; maxOutputTokens?: number }>
           }
+
+          // Log raw result for debugging context window issues
+          logger.log(`[Claude result] raw: cost=${resultMsg.total_cost_usd}, usage=${JSON.stringify(resultMsg.usage)}, modelUsage=${JSON.stringify(resultMsg.modelUsage)}, turns=${resultMsg.num_turns}, duration=${resultMsg.duration_ms}`)
 
           session.state.totalCost = resultMsg.total_cost_usd
           session.state.totalTokens =
@@ -788,12 +934,18 @@ export class ClaudeAgentManager {
             let totalInput = 0
             let totalOutput = 0
             for (const [model, modelStats] of Object.entries(resultMsg.modelUsage)) {
-              const line = `[Claude ctx] modelUsage[${model}]: input=${modelStats.inputTokens}, output=${modelStats.outputTokens}, contextWindow=${modelStats.contextWindow}`
+              const stats = modelStats as { inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; contextWindow?: number }
+              const cacheRead = stats.cacheReadInputTokens || 0
+              const cacheCreate = stats.cacheCreationInputTokens || 0
+              const line = `[Claude ctx] modelUsage[${model}]: input=${stats.inputTokens}, output=${stats.outputTokens}, cacheRead=${cacheRead}, cacheCreate=${cacheCreate}, contextWindow=${stats.contextWindow}`
               logger.log(line)
-              totalInput += modelStats.inputTokens || 0
-              totalOutput += modelStats.outputTokens || 0
-              if (modelStats.contextWindow) {
-                session.metadata.contextWindow = modelStats.contextWindow
+              totalInput += (stats.inputTokens || 0) + cacheRead + cacheCreate
+              totalOutput += stats.outputTokens || 0
+              if (stats.contextWindow) {
+                session.metadata.contextWindow = stats.contextWindow
+              }
+              if ((modelStats as { maxOutputTokens?: number }).maxOutputTokens) {
+                session.metadata.maxOutputTokens = (modelStats as { maxOutputTokens?: number }).maxOutputTokens!
               }
             }
             const summary = `[Claude ctx] prev: input=${session.metadata.inputTokens}, output=${session.metadata.outputTokens} | new: input=${totalInput}, output=${totalOutput} | cost=${resultMsg.total_cost_usd}`
@@ -801,11 +953,14 @@ export class ClaudeAgentManager {
             session.metadata.inputTokens = totalInput
             session.metadata.outputTokens = totalOutput
           } else if (resultMsg.usage) {
-            const line = `[Claude ctx] usage fallback: input=${resultMsg.usage.input_tokens}, output=${resultMsg.usage.output_tokens} | prev: input=${session.metadata.inputTokens}, output=${session.metadata.outputTokens}`
+            const usageFull = resultMsg.usage as { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }
+            const cacheRead = usageFull.cache_read_input_tokens || 0
+            const cacheCreate = usageFull.cache_creation_input_tokens || 0
+            const totalInput = (usageFull.input_tokens || 0) + cacheRead + cacheCreate
+            const line = `[Claude ctx] usage fallback: input=${usageFull.input_tokens}, output=${usageFull.output_tokens}, cacheRead=${cacheRead}, cacheCreate=${cacheCreate} | prev: input=${session.metadata.inputTokens}, output=${session.metadata.outputTokens}`
             logger.log(line)
-            // Fallback: usage is session-cumulative (like total_cost_usd), assign directly
-            session.metadata.inputTokens = resultMsg.usage.input_tokens || 0
-            session.metadata.outputTokens = resultMsg.usage.output_tokens || 0
+            session.metadata.inputTokens = totalInput
+            session.metadata.outputTokens = usageFull.output_tokens || 0
           }
 
           this.send('claude:status', sessionId, { ...session.metadata })
@@ -817,6 +972,9 @@ export class ClaudeAgentManager {
             result: resultMsg.result,
             errors: resultMsg.errors,
           })
+
+          // Send system notification on agent completion
+          this.sendCompletionNotification(session, resultMsg.result)
         }
       }
     } catch (error: unknown) {
@@ -848,13 +1006,28 @@ export class ClaudeAgentManager {
         if (error instanceof Error && error.stack) {
           logger.error('Stack:', error.stack)
         }
-        // Include stderr hint in error message if available
-        const displayMsg = stderrOutput
-          ? `${errMsg}\n${stderrOutput.slice(0, 500)}`
-          : errMsg
+        // Detect node spawn failures and provide helpful guidance
+        const combined = `${errMsg}\n${stderrOutput}`
+        const isNodeError = /ENOENT|spawn.*node|node.*spawn|cannot find.*node|node\.exe.*not found/i.test(combined)
+          || (errMsg.includes('spawn') && getNodeExecutable() === 'node')
+        const displayMsg = isNodeError
+          ? `Node.js not found.\n\nThe Claude Agent SDK requires Node.js to run. Please install it:\n\n` +
+            (process.platform === 'win32'
+              ? `  winget install OpenJS.NodeJS.LTS\n\nor download from https://nodejs.org`
+              : process.platform === 'darwin'
+                ? `  brew install node\n\nor download from https://nodejs.org`
+                : `  Install via your package manager or https://nodejs.org`) +
+            `\n\nRestart Better Agent Terminal after installation.`
+          : stderrOutput
+            ? `${errMsg}\n${stderrOutput.slice(0, 500)}`
+            : errMsg
         this.send('claude:error', sessionId, displayMsg)
       }
     } finally {
+      // Clean up ELECTRON_RUN_AS_NODE to avoid affecting other child processes
+      if (electronFallback) {
+        delete process.env.ELECTRON_RUN_AS_NODE
+      }
       if (session) {
         session.state.isStreaming = false
         session.currentPrompt = undefined
@@ -1440,15 +1613,60 @@ export class ClaudeAgentManager {
   async forkSession(sessionId: string): Promise<{ newSdkSessionId: string } | null> {
     const session = this.sessions.get(sessionId)
     const currentSdkId = session?.sdkSessionId || sdkSessionIds.get(sessionId)
-    if (!currentSdkId) return null
-
-    const cwd = session?.cwd
-    if (!forkSessionFn) {
-      const sdk = await import('@anthropic-ai/claude-agent-sdk')
-      forkSessionFn = sdk.forkSession
+    if (!currentSdkId) {
+      logger.warn(`[forkSession] no sdkSessionId for session ${sessionId.slice(0, 8)}`)
+      return null
     }
-    const result = await forkSessionFn(currentSdkId, { dir: cwd })
-    return { newSdkSessionId: result.sessionId }
+
+    // sdk.forkSession is NOT an exported function — it's a QueryOptions boolean.
+    // Correct approach: call query() with { resume: currentSdkId, forkSession: true },
+    // capture the new session_id from system:init, then abort immediately.
+    const query = await getQuery()
+    const claudeCodePath = resolveClaudeCodePath()
+    const nodeExecutable = getNodeExecutable()
+    const cwd = session?.cwd
+
+    logger.log(`[forkSession] starting: sdkSessionId=${currentSdkId.slice(0, 8)} cwd=${cwd}`)
+
+    const abortController = new AbortController()
+    let newSdkSessionId: string | null = null
+
+    try {
+      const generator = query({
+        prompt: ' ',
+        options: {
+          abortController,
+          cwd,
+          resume: currentSdkId,
+          forkSession: true,
+          ...(claudeCodePath ? { pathToClaudeCodeExecutable: claudeCodePath } : {}),
+          ...(nodeExecutable !== 'node' ? { executable: nodeExecutable } : {}),
+        } as Parameters<typeof query>[0]['options'],
+      })
+
+      for await (const message of generator) {
+        if (message.type === 'system' && (message as { subtype?: string }).subtype === 'init') {
+          newSdkSessionId = (message as { session_id: string }).session_id
+          logger.log(`[forkSession] received init, new session=${newSdkSessionId?.slice(0, 8)}`)
+          abortController.abort()
+          break
+        }
+      }
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e)
+      const isExpectedAbort = errMsg.includes('abort') || errMsg.includes('aborted') || abortController.signal.aborted
+      if (!isExpectedAbort) {
+        logger.error(`[forkSession] unexpected error:`, e)
+      }
+    }
+
+    if (!newSdkSessionId) {
+      logger.error(`[forkSession] failed — did not receive system:init`)
+      return null
+    }
+
+    logger.log(`[forkSession] success newSdkSessionId=${newSdkSessionId.slice(0, 8)}`)
+    return { newSdkSessionId }
   }
 
   dispose() {

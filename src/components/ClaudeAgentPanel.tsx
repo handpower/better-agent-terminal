@@ -7,6 +7,20 @@ import { settingsStore } from '../stores/settings-store'
 import { workspaceStore } from '../stores/workspace-store'
 import type { AgentPresetId } from '../types/agent-presets'
 import { LinkedText, FilePreviewModal } from './PathLinker'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
+
+// Markdown rendering for completed assistant messages
+// Note: marked.use() modifies the global marked instance (shared with FileTree).
+// Both use the same settings (gfm, breaks, highlight.js, link interception),
+// so sharing is intentional and avoids configuration drift.
+function renderChatMarkdown(text: string): string {
+  const rawHtml = marked.parse(text) as string
+  return DOMPurify.sanitize(rawHtml, {
+    ADD_TAGS: ['input'],
+    ADD_ATTR: ['checked', 'disabled', 'type', 'data-external-link'],
+  })
+}
 
 interface SessionMeta {
   model?: string
@@ -18,6 +32,7 @@ interface SessionMeta {
   durationMs: number
   numTurns: number
   contextWindow: number
+  maxOutputTokens: number
   permissionMode?: string
 }
 
@@ -112,7 +127,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
   })
   const [permissionMode, setPermissionMode] = useState<string>('bypassPermissions')
   const [currentModel, setCurrentModel] = useState<string>('')
-  const [effortLevel, setEffortLevel] = useState<string>('high')
+  const [effortLevel, setEffortLevel] = useState<string>('medium')
   const [enable1MContext, setEnable1MContext] = useState(false)
   const [claudeUsage, setClaudeUsage] = useState(workspaceStore.claudeUsage)
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([])
@@ -411,13 +426,20 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
           setSubagentStreamingThinking(prev => { const n = new Map(prev); n.delete(message.parentToolUseId!); return n })
           return
         }
-        // Deduplicate by id; attach streaming thinking if backend didn't provide it
+        // Deduplicate by id; for user messages also dedup by content+timestamp proximity
+        // (the sender already adds the message locally, backend broadcasts it for other windows)
         setStreamingThinking(prevThinking => {
           const finalMsg = (!message.thinking && prevThinking && message.role === 'assistant')
             ? { ...message, thinking: prevThinking }
             : message
           setMessages(prev => {
             if (prev.some(m => m.id === finalMsg.id)) return prev
+            // Dedup user messages: if a local user message with same content exists within 5s, skip
+            if (finalMsg.role === 'user' && prev.some(m =>
+              !isToolCall(m) && (m as ClaudeMessage).role === 'user' &&
+              (m as ClaudeMessage).content === finalMsg.content &&
+              Math.abs((m as ClaudeMessage).timestamp - finalMsg.timestamp) < 5000
+            )) return prev
             return [...prev, finalMsg]
           })
           return ''
@@ -710,10 +732,16 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
       const terminal = workspaceStore.getState().terminals.find(t => t.id === sessionId)
       const savedSdkSessionId = terminal?.sdkSessionId
       const savedModel = terminal?.model
+      const globalSettings = settingsStore.getSettings()
       dlog(`${stag} sdkSessionId=${savedSdkSessionId?.slice(0, 8)} pendingPrompt="${terminal?.pendingPrompt || ''}"`)
 
-      // Restore saved model to UI
-      if (savedModel) setCurrentModel(savedModel)
+      // Restore saved model to UI, or use global default
+      const effectiveModel = savedModel || globalSettings.defaultModel
+      if (effectiveModel) setCurrentModel(effectiveModel)
+
+      // Use global default effort
+      const effectiveEffort = globalSettings.defaultEffort || 'medium'
+      setEffortLevel(effectiveEffort)
 
       if (savedSdkSessionId) {
         dlog(`${stag} AUTO-RESUME sdkSessionId=${savedSdkSessionId.slice(0, 8)}`)
@@ -721,7 +749,7 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         window.electronAPI.claude.resumeSession(sessionId, savedSdkSessionId, cwd, savedModel)
       } else {
         dlog(`${stag} FRESH startSession`)
-        window.electronAPI.claude.startSession(sessionId, { cwd, permissionMode, model: savedModel })
+        window.electronAPI.claude.startSession(sessionId, { cwd, permissionMode, model: effectiveModel, effort: effectiveEffort as 'low' | 'medium' | 'high' | 'max' })
       }
     }
     return () => {
@@ -754,7 +782,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
         if (info) setAccountInfo(info)
       }).catch(() => {})
       window.electronAPI.claude.getSupportedCommands(sessionId).then((cmds: SlashCommandInfo[]) => {
-        if (cmds && cmds.length > 0) setSlashCommands(cmds)
+        if (cmds && cmds.length > 0) {
+          setSlashCommands(cmds)
+          // Broadcast for SkillsPanel (in case it mounted before commands were fetched)
+          window.dispatchEvent(new CustomEvent('claude-skills-updated', { detail: { sessionId, commands: cmds } }))
+        }
       }).catch(() => {})
     }
   }, [sessionId, sessionMeta?.sdkSessionId, availableModels.length])
@@ -842,9 +874,20 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     const tag = `[Fork:${sessionId.slice(0, 8)}]`
     dlog(`${tag} start hasSdkSession=${hasSdkSession} workspaceId=${workspaceId}`)
     if (!hasSdkSession || !workspaceId) return
-    const result = await window.electronAPI.claude.forkSession(sessionId)
+    let result: { newSdkSessionId: string } | null = null
+    try {
+      result = await window.electronAPI.claude.forkSession(sessionId)
+    } catch (e) {
+      dlog(`${tag} forkSession threw:`, e)
+      alert('Fork failed: ' + (e instanceof Error ? e.message : String(e)))
+      return
+    }
     dlog(`${tag} forkSession result=`, result)
-    if (!result?.newSdkSessionId) return
+    if (!result?.newSdkSessionId) {
+      dlog(`${tag} fork returned null — check main process logs`)
+      alert('Fork failed: backend returned no session ID. Check that Claude session is active.')
+      return
+    }
 
     const prompt = inputValueRef.current.trim()
     const images = attachedImages.map(img => img.dataUrl)
@@ -882,6 +925,18 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
     inputValueRef.current = val
     if (textareaRef.current) textareaRef.current.value = val
   }, [])
+
+  // Listen for skill insertion from SkillsPanel
+  useEffect(() => {
+    const handler = (e: Event) => {
+      if (!isActive) return
+      const { name } = (e as CustomEvent).detail as { name: string }
+      setInputValue('/' + name + ' ')
+      textareaRef.current?.focus()
+    }
+    window.addEventListener('claude-insert-command', handler)
+    return () => window.removeEventListener('claude-insert-command', handler)
+  }, [isActive, setInputValue])
 
   const handleSend = useCallback(async () => {
     const trimmed = inputValueRef.current.trim()
@@ -2105,7 +2160,20 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               </div>
             )
           })()}
-          {msg.content && <div className="claude-markdown"><LinkedText text={msg.content} /></div>}
+          {msg.content && (
+            <div
+              className="claude-markdown"
+              dangerouslySetInnerHTML={{ __html: renderChatMarkdown(msg.content) }}
+              onClick={(e) => {
+                const target = e.target as HTMLElement
+                const link = target.closest('a[data-external-link]') as HTMLAnchorElement | null
+                if (link) {
+                  e.preventDefault()
+                  window.electronAPI.shell.openExternal(link.href)
+                }
+              }}
+            />
+          )}
           {msg.timestamp > 0 && (
             <span className="claude-msg-time" title={formatFullTimestamp(msg.timestamp)}>{formatTimestamp(msg.timestamp)}</span>
           )}
@@ -2587,7 +2655,6 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
               <option value="low">low</option>
               <option value="medium">medium</option>
               <option value="high">high</option>
-              <option value="max">max</option>
             </select>
             {accountInfo?.organization && (
               <span className="claude-status-btn claude-account-info" title={`${accountInfo.email || ''} (${accountInfo.subscriptionType || 'unknown'})`}>
@@ -2828,6 +2895,11 @@ export function ClaudeAgentPanel({ sessionId, cwd, isActive, workspaceId }: Read
             if (!claudeUsage?.sevenDayReset) return null
             return <span key="usage7dReset" className="claude-statusline-item">↻{fmtRemaining(new Date(claudeUsage.sevenDayReset))}</span>
           },
+          maxOut: () => !sessionMeta || !sessionMeta.maxOutputTokens ? null : (
+            <span key="maxOut" className="claude-statusline-item" title={`Max output: ${sessionMeta.maxOutputTokens.toLocaleString()} tokens`}>
+              maxOut:{(sessionMeta.maxOutputTokens / 1000).toFixed(0)}k
+            </span>
+          ),
           prompts: () => (
             <span key="prompts" className="claude-statusline-item claude-statusline-clickable"
               onClick={() => setShowPromptHistory(true)} title={t('claude.viewPromptHistory')}>{t('claude.prompts')}</span>

@@ -26,7 +26,7 @@ const defaultSettings: AppSettings = {
   defaultTerminalCount: 1,
   createDefaultAgentTerminal: true,
   allowBypassPermissions: true,
-  enable1MContext: false
+  enable1MContext: true
 }
 
 class SettingsStore {
@@ -188,6 +188,43 @@ class SettingsStore {
 
   setEnable1MContext(enable: boolean): void {
     this.settings = { ...this.settings, enable1MContext: enable }
+    this.notify()
+    this.save()
+  }
+
+  setDefaultModel(model: string): void {
+    this.settings = { ...this.settings, defaultModel: model || undefined }
+    this.notify()
+    this.save()
+  }
+
+  setDefaultEffort(effort: 'low' | 'medium' | 'high' | 'max'): void {
+    this.settings = { ...this.settings, defaultEffort: effort }
+    this.notify()
+    this.save()
+  }
+
+  setShowDockBadge(show: boolean): void {
+    this.settings = { ...this.settings, showDockBadge: show }
+    this.notify()
+    this.save()
+    if (!show) window.electronAPI?.app?.setDockBadge?.(0)
+  }
+
+  setNotifyOnComplete(enabled: boolean): void {
+    this.settings = { ...this.settings, notifyOnComplete: enabled }
+    this.notify()
+    this.save()
+  }
+
+  setNotifySound(enabled: boolean): void {
+    this.settings = { ...this.settings, notifySound: enabled }
+    this.notify()
+    this.save()
+  }
+
+  setNotifyOnlyBackground(enabled: boolean): void {
+    this.settings = { ...this.settings, notifyOnlyBackground: enabled }
     this.notify()
     this.save()
   }

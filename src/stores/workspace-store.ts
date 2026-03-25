@@ -2,6 +2,7 @@ import { v4 as uuidv4 } from 'uuid'
 import type { Workspace, TerminalInstance, AppState } from '../types'
 import { AgentPresetId, getAgentPreset } from '../types/agent-presets'
 import { clearPreviewCache } from '../components/TerminalThumbnail'
+import { settingsStore } from './settings-store'
 
 type Listener = () => void
 
@@ -472,6 +473,17 @@ class WorkspaceStore {
     this.save()
   }
 
+  setWorkspaceColor(id: string, color: string | undefined): void {
+    this.state = {
+      ...this.state,
+      workspaces: this.state.workspaces.map(w =>
+        w.id === id ? { ...w, color } : w
+      )
+    }
+    this.notify()
+    this.save()
+  }
+
   getGroups(): string[] {
     const groups = new Set<string>()
     for (const w of this.state.workspaces) {
@@ -508,6 +520,14 @@ class WorkspaceStore {
       )
     }
     this.notify()
+    this.updateDockBadge()
+  }
+
+  private updateDockBadge(): void {
+    const settings = settingsStore.getSettings()
+    if (settings.showDockBadge === false) return
+    const count = this.state.terminals.filter(t => t.hasPendingAction).length
+    window.electronAPI?.app?.setDockBadge?.(count)
   }
 
   getWorkspaceLastActivity(workspaceId: string): number | null {

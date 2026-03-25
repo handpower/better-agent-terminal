@@ -311,6 +311,89 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
               </label>
               <p className="settings-hint">{t('settings.allowBypassPermissionsHint')}</p>
             </div>
+
+            <div className="settings-group checkbox-group">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={settings.enable1MContext !== false}
+                  onChange={e => settingsStore.setEnable1MContext(e.target.checked)}
+                />
+                {t('settings.enable1MContext')}
+              </label>
+              <p className="settings-hint">{t('settings.enable1MContextHint')}</p>
+            </div>
+
+            <div className="settings-group">
+              <label>{t('settings.defaultModel')}</label>
+              <input
+                type="text"
+                value={settings.defaultModel || ''}
+                onChange={e => settingsStore.setDefaultModel(e.target.value)}
+                placeholder={t('settings.defaultModelPlaceholder')}
+              />
+              <p className="settings-hint">{t('settings.defaultModelHint')}</p>
+            </div>
+
+            <div className="settings-group">
+              <label>{t('settings.defaultEffort')}</label>
+              <select
+                value={settings.defaultEffort || 'medium'}
+                onChange={e => settingsStore.setDefaultEffort(e.target.value as 'low' | 'medium' | 'high')}
+              >
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+              </select>
+              <p className="settings-hint">{t('settings.defaultEffortHint')}</p>
+            </div>
+          </div>
+
+          <div className="settings-section">
+            <h3>{t('settings.notifications')}</h3>
+            <div className="settings-group checkbox-group">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={settings.showDockBadge !== false}
+                  onChange={e => settingsStore.setShowDockBadge(e.target.checked)}
+                />
+                {t('settings.showDockBadge')}
+              </label>
+              <p className="settings-hint">{t('settings.showDockBadgeHint')}</p>
+            </div>
+            <div className="settings-group checkbox-group">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={settings.notifyOnComplete !== false}
+                  onChange={e => settingsStore.setNotifyOnComplete(e.target.checked)}
+                />
+                {t('settings.notifyOnComplete')}
+              </label>
+              <p className="settings-hint">{t('settings.notifyOnCompleteHint')}</p>
+            </div>
+            <div className="settings-group checkbox-group">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={settings.notifySound !== false}
+                  onChange={e => settingsStore.setNotifySound(e.target.checked)}
+                />
+                {t('settings.notifySound')}
+              </label>
+            </div>
+            <div className="settings-group checkbox-group">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={settings.notifyOnlyBackground !== false}
+                  onChange={e => settingsStore.setNotifyOnlyBackground(e.target.checked)}
+                />
+                {t('settings.notifyOnlyBackground')}
+              </label>
+              <p className="settings-hint">{t('settings.notifyOnlyBackgroundHint')}</p>
+            </div>
           </div>
 
           <div className="settings-section">

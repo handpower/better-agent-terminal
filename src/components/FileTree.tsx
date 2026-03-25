@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { HighlightedCode } from './PathLinker'
+import hljs from 'highlight.js/lib/core'
 
 interface FileEntry {
   name: string
@@ -121,11 +122,130 @@ function getFileIcon(name: string): string {
   }
 }
 
-function FilePreview({ filePath, fileName }: { filePath: string; fileName: string }) {
+// Markdown rendering using marked + DOMPurify + highlight.js
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
+
+// Configure marked with GFM (tables, task lists, strikethrough) + highlight.js
+marked.setOptions({
+  gfm: true,
+  breaks: true,
+})
+
+// Custom renderer for code blocks (syntax highlighting) and links (open in browser)
+const renderer = new marked.Renderer()
+
+renderer.code = function ({ text, lang }: { text: string; lang?: string }) {
+  // Mermaid blocks: render as div with class "mermaid" for post-render processing
+  if (lang === 'mermaid') {
+    return `<div class="mermaid">${text}</div>`
+  }
+  let highlighted: string
+  try {
+    highlighted = lang
+      ? hljs.highlight(text, { language: lang }).value
+      : hljs.highlightAuto(text).value
+  } catch {
+    highlighted = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  }
+  return `<pre><code class="hljs${lang ? ` language-${lang}` : ''}">${highlighted}</code></pre>`
+}
+
+renderer.link = function ({ href, text }: { href: string; text: string }) {
+  // Links open in external browser, not inside Electron
+  return `<a href="${href}" data-external-link="true">${text}</a>`
+}
+
+renderer.image = function ({ href, text }: { href: string; text: string }) {
+  // Support local file paths
+  const src = href.startsWith('/') ? `file://${href}` : href
+  return `<img alt="${text || ''}" src="${src}" style="max-width:100%"/>`
+}
+
+marked.use({ renderer })
+
+function renderMarkdown(text: string): string {
+  const rawHtml = marked.parse(text) as string
+  return DOMPurify.sanitize(rawHtml, {
+    ADD_TAGS: ['input'],  // Allow checkboxes for task lists
+    ADD_ATTR: ['checked', 'disabled', 'type', 'data-external-link'],
+  })
+}
+
+// Mermaid rendering: dynamically import mermaid only when needed
+let mermaidInstance: typeof import('mermaid')['default'] | null = null
+
+async function getMermaid() {
+  if (!mermaidInstance) {
+    mermaidInstance = (await import('mermaid')).default
+    mermaidInstance.initialize({
+      startOnLoad: false,
+      theme: 'dark',
+      themeVariables: {
+        darkMode: true,
+        background: '#1e1e1e',
+        primaryColor: '#3498db',
+        primaryTextColor: '#e0e0e0',
+        lineColor: '#666',
+      },
+    })
+  }
+  return mermaidInstance
+}
+
+async function renderMermaidBlocks(container: HTMLElement) {
+  const mermaidDivs = container.querySelectorAll('.mermaid')
+  if (mermaidDivs.length === 0) return
+
+  const mermaid = await getMermaid()
+  mermaidDivs.forEach((div, i) => {
+    div.id = `mermaid-${Date.now()}-${i}`
+  })
+  try {
+    await mermaid.run({ nodes: mermaidDivs as unknown as ArrayLike<HTMLElement> })
+  } catch {
+    mermaidDivs.forEach(div => {
+      if (!div.querySelector('svg')) {
+        div.classList.add('mermaid-error')
+      }
+    })
+  }
+}
+
+function MarkdownPreview({ content }: { content: string }) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const html = renderMarkdown(content)
+
+  useEffect(() => {
+    if (containerRef.current) {
+      renderMermaidBlocks(containerRef.current)
+    }
+  }, [html])
+
+  return (
+    <div
+      ref={containerRef}
+      className="file-preview-markdown"
+      dangerouslySetInnerHTML={{ __html: html }}
+      onClick={(e) => {
+        const target = e.target as HTMLElement
+        const link = target.closest('a[data-external-link]') as HTMLAnchorElement | null
+        if (link) {
+          e.preventDefault()
+          window.electronAPI.shell.openExternal(link.href)
+        }
+      }}
+    />
+  )
+}
+
+function FilePreview({ filePath, fileName, refreshKey }: { filePath: string; fileName: string; refreshKey: number }) {
   const [content, setContent] = useState<string | null>(null)
   const [imageUrl, setImageUrl] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [viewMode, setViewMode] = useState<'source' | 'rendered'>('rendered')
+  const isMarkdown = getFileExt(fileName) === 'md'
 
   useEffect(() => {
     let cancelled = false
@@ -161,7 +281,7 @@ function FilePreview({ filePath, fileName }: { filePath: string; fileName: strin
     }
 
     return () => { cancelled = true }
-  }, [filePath, fileName])
+  }, [filePath, fileName, refreshKey])
 
   if (loading) {
     return <div className="file-preview-status">Loading...</div>
@@ -181,7 +301,18 @@ function FilePreview({ filePath, fileName }: { filePath: string; fileName: strin
 
   if (content !== null) {
     return (
-      <HighlightedCode code={content} ext={getFileExt(fileName)} className="file-preview-text" />
+      <>
+        {isMarkdown && (
+          <div className="file-preview-mode-bar">
+            <button className={`git-diff-mode-btn${viewMode === 'rendered' ? ' active' : ''}`} onClick={() => setViewMode('rendered')}>Preview</button>
+            <button className={`git-diff-mode-btn${viewMode === 'source' ? ' active' : ''}`} onClick={() => setViewMode('source')}>Source</button>
+          </div>
+        )}
+        {isMarkdown && viewMode === 'rendered'
+          ? <MarkdownPreview content={content} />
+          : <HighlightedCode code={content} ext={getFileExt(fileName)} className="file-preview-text" />
+        }
+      </>
     )
   }
 
@@ -192,12 +323,14 @@ export function FileTree({ rootPath }: Readonly<FileTreeProps>) {
   const [entries, setEntries] = useState<FileEntry[]>([])
   const [loading, setLoading] = useState(true)
   const [selectedFile, setSelectedFile] = useState<FileEntry | null>(null)
+  const restoredRef = useRef(false)
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry } | null>(null)
   const contextMenuRef = useRef<HTMLDivElement>(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<FileEntry[] | null>(null)
   const [searching, setSearching] = useState(false)
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [refreshKey, setRefreshKey] = useState(0)
 
   const loadRoot = useCallback(async () => {
     setLoading(true)
@@ -210,9 +343,29 @@ export function FileTree({ rootPath }: Readonly<FileTreeProps>) {
     setLoading(false)
   }, [rootPath])
 
+  const handleRefresh = useCallback(() => {
+    setRefreshKey(k => k + 1)
+    loadRoot()
+  }, [loadRoot])
+
   useEffect(() => {
     loadRoot()
   }, [loadRoot])
+
+  // Watch for file system changes and auto-refresh
+  useEffect(() => {
+    window.electronAPI.fs.watch(rootPath)
+    const unsubscribe = window.electronAPI.fs.onChanged((changedPath: string) => {
+      if (changedPath === rootPath) {
+        setRefreshKey(k => k + 1)
+        loadRoot()
+      }
+    })
+    return () => {
+      unsubscribe()
+      window.electronAPI.fs.unwatch(rootPath)
+    }
+  }, [rootPath, loadRoot])
 
   // Close context menu on outside click
   useEffect(() => {
@@ -248,9 +401,32 @@ export function FileTree({ rootPath }: Readonly<FileTreeProps>) {
     return () => { if (searchTimerRef.current) clearTimeout(searchTimerRef.current) }
   }, [searchQuery, rootPath])
 
+  // Restore last selected file on mount
+  useEffect(() => {
+    if (restoredRef.current) return
+    restoredRef.current = true
+    const storageKey = `file-tree-selected:${rootPath}`
+    const saved = localStorage.getItem(storageKey)
+    if (!saved) return
+    try {
+      const { path, name } = JSON.parse(saved)
+      // Check if file still exists
+      window.electronAPI.fs.readFile(path).then(result => {
+        if (!result.error) {
+          setSelectedFile({ path, name, isDirectory: false })
+        } else {
+          localStorage.removeItem(storageKey)
+        }
+      })
+    } catch {
+      localStorage.removeItem(storageKey)
+    }
+  }, [rootPath])
+
   const handleSelect = useCallback((entry: FileEntry) => {
     setSelectedFile(entry)
-  }, [])
+    localStorage.setItem(`file-tree-selected:${rootPath}`, JSON.stringify({ path: entry.path, name: entry.name }))
+  }, [rootPath])
 
   const handleContextMenu = useCallback((e: React.MouseEvent, entry: FileEntry) => {
     e.preventDefault()
@@ -307,7 +483,7 @@ export function FileTree({ rootPath }: Readonly<FileTreeProps>) {
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
           />
-          <button className="file-tree-refresh-btn" onClick={loadRoot} title="Refresh">↻</button>
+          <button className="file-tree-refresh-btn" onClick={handleRefresh} title="Refresh">↻</button>
         </div>
         <div className="file-tree-list">
           {searching && <div className="file-tree-item file-tree-loading-row">Searching...</div>}
@@ -330,7 +506,7 @@ export function FileTree({ rootPath }: Readonly<FileTreeProps>) {
           ) : (
             entries.map(entry => (
               <FileTreeNode
-                key={entry.path}
+                key={`${entry.path}:${refreshKey}`}
                 entry={entry}
                 depth={0}
                 selectedPath={selectedFile?.path || null}
@@ -349,9 +525,10 @@ export function FileTree({ rootPath }: Readonly<FileTreeProps>) {
           <>
             <div className="file-preview-header">
               <span className="file-preview-filename">{selectedFile.name}</span>
+              <button className="file-tree-refresh-btn" onClick={handleRefresh} title="Refresh">↻</button>
             </div>
             <div className="file-preview-body">
-              <FilePreview filePath={selectedFile.path} fileName={selectedFile.name} />
+              <FilePreview filePath={selectedFile.path} fileName={selectedFile.name} refreshKey={refreshKey} />
             </div>
           </>
         ) : (

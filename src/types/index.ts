@@ -16,8 +16,20 @@ export interface Workspace {
   defaultAgent?: AgentPresetId;  // Workspace 預設 Agent
   envVars?: EnvVariable[];       // Workspace 專屬環境變數
   group?: string;                // Workspace 分組
+  color?: string;                // Workspace 顏色標籤
   lastSdkSessionId?: string;     // 上次使用的 SDK session ID，下次自動 resume
 }
+
+export const WORKSPACE_COLORS = [
+  { id: 'red', value: '#e74c3c', label: 'Red' },
+  { id: 'orange', value: '#e67e22', label: 'Orange' },
+  { id: 'yellow', value: '#f1c40f', label: 'Yellow' },
+  { id: 'green', value: '#2ecc71', label: 'Green' },
+  { id: 'blue', value: '#3498db', label: 'Blue' },
+  { id: 'purple', value: '#9b59b6', label: 'Purple' },
+  { id: 'pink', value: '#e91e8a', label: 'Pink' },
+  { id: 'gray', value: '#95a5a6', label: 'Gray' },
+] as const
 
 export interface TerminalInstance {
   id: string;
@@ -199,7 +211,25 @@ export interface AppSettings {
   createDefaultAgentTerminal: boolean;  // 是否預設建立 Agent Terminal
   allowBypassPermissions: boolean;  // 允許切換 bypassPermissions 模式時不再確認
   enable1MContext: boolean;  // 啟用 1M token context (僅 Sonnet 4/4.5)
+  defaultModel?: string;     // 預設模型（空 = 使用 SDK 預設）
+  defaultEffort?: 'low' | 'medium' | 'high' | 'max';  // 預設 effort level
+  showDockBadge?: boolean;               // Dock 圖示顯示待處理數量
+  notifyOnComplete?: boolean;           // Agent 完成時發送系統通知
+  notifySound?: boolean;               // 通知時播放聲音
+  notifyOnlyBackground?: boolean;      // 僅在視窗不在前景時通知
   statuslineItems?: StatuslineItemConfig[];  // 自訂 statusline 項目排序和顯示
+}
+
+// ============================================
+//   Skill Commands
+// ============================================
+
+export interface SkillCommand {
+  name: string
+  description: string
+  argumentHint?: string
+  scope: 'project' | 'global'
+  source: 'filesystem' | 'sdk'
 }
 
 // ============================================
@@ -210,7 +240,7 @@ export type StatuslineItemId =
   | 'sessionId' | 'tokens' | 'turns' | 'duration'
   | 'contextPct' | 'cost' | 'workspace' | 'gitBranch'
   | 'usage5h' | 'usage5hReset' | 'usage7d' | 'usage7dReset'
-  | 'prompts'
+  | 'maxOut' | 'prompts'
 
 export interface StatuslineItemConfig {
   id: StatuslineItemId
@@ -241,5 +271,6 @@ export const STATUSLINE_ITEMS: StatuslineItemDef[] = [
   { id: 'usage5hReset', label: '5h Reset',     description: '5-hour usage reset countdown',                       defaultVisible: true,  group: 'limits' },
   { id: 'usage7d',      label: '7d Usage',     description: '7-day usage percentage',                             defaultVisible: true,  group: 'limits' },
   { id: 'usage7dReset', label: '7d Reset',     description: '7-day usage reset countdown',                        defaultVisible: true,  group: 'limits' },
+  { id: 'maxOut',        label: 'Max Output',   description: 'Maximum output tokens for current model',            defaultVisible: false, group: 'context' },
   { id: 'prompts',      label: 'Prompts',      description: 'Link to view prompt history',                        defaultVisible: true,  group: 'actions' },
 ]

@@ -27,8 +27,25 @@ if (process.platform === 'darwin') {
       '/opt/homebrew/bin',
       '/usr/local/bin',
       `${process.env.HOME}/.volta/bin`,
-    ].join(':')
-    process.env.PATH = `${extraPaths}:${process.env.PATH || ''}`
+    ]
+    // Resolve nvm: find the latest installed version's bin directory.
+    // NOTE: This intentionally duplicates the semver sort from node-resolver.ts
+    // because this code runs at the top level before any ES module imports,
+    // and importing node-resolver here would break the PATH fix ordering.
+    try {
+      const nvmDir = `${process.env.HOME}/.nvm/versions/node`
+      const versions = fsSync.readdirSync(nvmDir).filter((v: string) => v.startsWith('v'))
+      if (versions.length > 0) {
+        versions.sort((a: string, b: string) => {
+          const pa = a.replace(/^v/, '').split('.').map(Number)
+          const pb = b.replace(/^v/, '').split('.').map(Number)
+          for (let i = 0; i < 3; i++) { const d = (pa[i]||0) - (pb[i]||0); if (d !== 0) return d; }
+          return 0
+        })
+        extraPaths.push(`${nvmDir}/${versions[versions.length - 1]}/bin`)
+      }
+    } catch { /* nvm not installed */ }
+    process.env.PATH = `${extraPaths.join(':')}:${process.env.PATH || ''}`
   }
 }
 import { PtyManager } from './pty-manager'
@@ -216,7 +233,7 @@ function createWindow() {
     frame: true,
     titleBarStyle: 'default',
     title: 'Better Agent Terminal',
-    icon: path.join(__dirname, process.platform === 'win32' ? '../assets/icon.ico' : '../assets/icon.png')
+    icon: nativeImage.createFromPath(path.join(__dirname, process.platform === 'win32' ? '../assets/icon.ico' : '../assets/icon.png'))
   })
 
   if (process.platform === 'darwin') {
@@ -424,7 +441,7 @@ function registerProxiedHandlers() {
   })
 
   // Claude Agent SDK
-  registerHandler('claude:start-session', (sessionId: string, options: { cwd: string; prompt?: string; permissionMode?: string; model?: string }) => claudeManager?.startSession(sessionId, options))
+  registerHandler('claude:start-session', (sessionId: string, options: { cwd: string; prompt?: string; permissionMode?: string; model?: string; effort?: string }) => claudeManager?.startSession(sessionId, options))
   registerHandler('claude:send-message', (sessionId: string, prompt: string, images?: string[]) => claudeManager?.sendMessage(sessionId, prompt, images))
   registerHandler('claude:stop-session', (sessionId: string) => claudeManager?.stopSession(sessionId))
   registerHandler('claude:set-permission-mode', (sessionId: string, mode: string) => claudeManager?.setPermissionMode(sessionId, mode as import('@anthropic-ai/claude-agent-sdk').PermissionMode))
@@ -435,6 +452,36 @@ function registerProxiedHandlers() {
   registerHandler('claude:get-supported-models', (sessionId: string) => claudeManager?.getSupportedModels(sessionId))
   registerHandler('claude:get-account-info', (sessionId: string) => claudeManager?.getAccountInfo(sessionId))
   registerHandler('claude:get-supported-commands', (sessionId: string) => claudeManager?.getSupportedCommands(sessionId))
+
+  // Scan .claude/commands/ directories for skill files
+  registerHandler('claude:scan-skills', async (cwd: string) => {
+    const fs = await import('fs')
+    const pathMod = await import('path')
+    const results: { name: string; description: string; scope: 'project' | 'global' }[] = []
+    const homePath = app.getPath('home')
+    const dirs: { dir: string; scope: 'project' | 'global' }[] = [
+      { dir: pathMod.join(cwd, '.claude', 'commands'), scope: 'project' },
+      { dir: pathMod.join(homePath, '.claude', 'commands'), scope: 'global' },
+    ]
+    for (const { dir, scope } of dirs) {
+      try {
+        if (!fs.existsSync(dir)) continue
+        const files = fs.readdirSync(dir).filter((f: string) => f.endsWith('.md'))
+        for (const file of files) {
+          const name = file.replace(/\.md$/, '')
+          try {
+            const content = fs.readFileSync(pathMod.join(dir, file), 'utf-8')
+            const firstLine = content.split('\n').find((l: string) => l.trim()) || ''
+            const description = firstLine.replace(/^#\s*/, '').trim()
+            results.push({ name, description, scope })
+          } catch {
+            results.push({ name, description: '', scope })
+          }
+        }
+      } catch { /* directory doesn't exist or not readable */ }
+    }
+    return results
+  })
   registerHandler('claude:get-session-meta', (sessionId: string) => claudeManager?.getSessionMeta(sessionId))
   registerHandler('claude:resolve-permission', (sessionId: string, toolUseId: string, result: { behavior: string; updatedInput?: Record<string, unknown>; updatedPermissions?: unknown[]; message?: string; dontAskAgain?: boolean }) => claudeManager?.resolvePermission(sessionId, toolUseId, result))
   registerHandler('claude:resolve-ask-user', (sessionId: string, toolUseId: string, answers: Record<string, string>) => claudeManager?.resolveAskUser(sessionId, toolUseId, answers))
@@ -794,6 +841,34 @@ function registerProxiedHandlers() {
   })
 
   // File system
+  // File watcher for auto-refresh
+  const fileWatchers = new Map<string, ReturnType<typeof fsSync.watch>>()
+  registerHandler('fs:watch', (_dirPath: string) => {
+    if (fileWatchers.has(_dirPath)) return true
+    try {
+      let debounceTimer: ReturnType<typeof setTimeout> | null = null
+      const watcher = fsSync.watch(_dirPath, { recursive: true }, () => {
+        if (debounceTimer) clearTimeout(debounceTimer)
+        debounceTimer = setTimeout(() => {
+          broadcastHub.broadcast('fs:changed', _dirPath)
+        }, 500)
+      })
+      watcher.on('error', () => {
+        fileWatchers.delete(_dirPath)
+      })
+      fileWatchers.set(_dirPath, watcher)
+      return true
+    } catch { return false }
+  })
+  registerHandler('fs:unwatch', (_dirPath: string) => {
+    const watcher = fileWatchers.get(_dirPath)
+    if (watcher) {
+      watcher.close()
+      fileWatchers.delete(_dirPath)
+    }
+    return true
+  })
+
   registerHandler('fs:readdir', async (dirPath: string) => {
     const IGNORED = new Set(['.git', 'node_modules', '.next', 'dist', 'dist-electron', '.cache', '__pycache__', '.DS_Store'])
     try {
@@ -1016,6 +1091,15 @@ function registerLocalHandlers() {
   // Get the profile ID this instance was launched with (--profile= argument)
   ipcMain.handle('app:get-launch-profile', () => launchProfileId)
 
+  // Dock badge count (macOS/Linux)
+  ipcMain.handle('app:set-dock-badge', (_event, count: number) => {
+    if (process.platform === 'darwin') {
+      app.dock.setBadge(count > 0 ? String(count) : '')
+    } else if (process.platform === 'linux') {
+      app.setBadgeCount(count)
+    }
+  })
+
   // Open new instance with a specific profile
   ipcMain.handle('app:open-new-instance', async (_event, profileId: string) => {
     const { spawn } = await import('child_process')
@@ -1033,7 +1117,7 @@ function registerLocalHandlers() {
     const detachedWin = new BrowserWindow({
       width: 900, height: 700, minWidth: 600, minHeight: 400,
       webPreferences: { preload: path.join(__dirname, 'preload.js'), nodeIntegration: false, contextIsolation: true },
-      frame: true, titleBarStyle: 'default', icon: path.join(__dirname, '../assets/icon.ico')
+      frame: true, titleBarStyle: 'default', icon: nativeImage.createFromPath(path.join(__dirname, process.platform === 'win32' ? '../assets/icon.ico' : '../assets/icon.png'))
     })
     setupResizeThrottle(detachedWin, 'detached')
     detachedWindows.set(workspaceId, detachedWin)
